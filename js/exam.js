@@ -12,12 +12,28 @@ const L = 'ABCD', MAX_AVISOS = 2;
 const NOMBRE = { A: 'Preguntas CON audio (listening)', T: 'Preguntas SIN audio (reading)' }; // para la evidencia (la ve el Administrador)
 const NAME = { A: 'Questions WITH audio (listening)', T: 'Questions WITHOUT audio (reading)' };
 const times = n => n === 1 ? 'time' : 'times';
+export const LEAD_S = 1.5; // pausa inicial para que la salida de audio despierte y no se corte el arranque
+function audioCtx() { const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return null; if (!audioCtx.ac || audioCtx.ac.state === 'closed') audioCtx.ac = new AC(); if (audioCtx.ac.state === 'suspended') audioCtx.ac.resume().catch(() => { }); return audioCtx.ac; }
+function warmupSilence(sec, token, cur) {
+  const t = Math.max(0.25, sec == null ? LEAD_S : sec);
+  return new Promise(res => {
+    const ac = audioCtx();
+    if (!ac) { setTimeout(() => { if (cur() === token) res(); }, t * 1000); return; }
+    const n = Math.max(1, Math.ceil(ac.sampleRate * t)), buf = ac.createBuffer(1, n, ac.sampleRate), src = ac.createBufferSource(), g = ac.createGain();
+    g.gain.value = 0.0001; src.buffer = buf; src.connect(g); g.connect(ac.destination);
+    src.onended = () => { if (cur() === token) res(); };
+    try { src.start(); } catch { setTimeout(() => { if (cur() === token) res(); }, t * 1000); }
+    setTimeout(() => { if (cur() === token) res(); }, t * 1000 + 80);
+  });
+}
+function silentUrl(sec) { const rate = 8000, n = Math.max(1, Math.ceil(rate * (sec == null ? LEAD_S : sec))), buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf); const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); }; w(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); w(8, 'WAVE'); w(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true); v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true); w(36, 'data'); v.setUint32(40, n * 2, true); return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' })); }
+function waitReady(el, ms) { return new Promise(res => { if (el.readyState >= 3) return res(); const t = setTimeout(ok, ms || 2500); function ok() { clearTimeout(t); el.removeEventListener('canplaythrough', ok); el.removeEventListener('canplay', ok); res(); } el.addEventListener('canplaythrough', ok); el.addEventListener('canplay', ok); }); }
 export function runExam(o) {
   // o: {root, meta:{ti,items}, plan, bloque, onBloque(b), answers, plays, maxPlays, deadline, getAudio, onAnswer, onPlay, incidentes, onIncident(inc), quien:{mat,nom}, onSubmit(motivo)}
-  const it = o.meta.items, N = it.length, P = o.plan; let seq = [], i = 0, audio = null, timer, ended = false, view = 'chooser', stopWatch = null, lockEl = null;
+  const it = o.meta.items, N = it.length, P = o.plan; let seq = [], i = 0, audio = null, timer, ended = false, view = 'chooser', stopWatch = null, lockEl = null, starting = false, audGen = 0;
   const inc = o.incidentes || (o.incidentes = []), TI = o.etiqueta || tituloEN(o.meta.ti); // v0.4: solo el TIPO de evaluación, nunca la forma
   const left = () => Math.max(0, Math.round((o.deadline - Date.now()) / 1000));
-  const stopAudio = () => { if (audio) { audio.onended = null; audio.pause(); audio.removeAttribute('src'); audio.load(); audio = null; } };
+  const stopAudio = () => { audGen++; starting = false; if (audio) { try { if (audio._src) audio._src.stop(); } catch { } audio.onended = null; try { audio.pause(); audio.removeAttribute('src'); audio.load(); } catch { } audio = null; } };
   const blockOf = k => it[k].au ? 'A' : 'T';
   const setSeq = () => { const f = o.bloque, s = f === 'A' ? 'T' : 'A'; seq = [...P[f], ...P[s]]; };
   const lockMedia = () => { try { if ('mediaSession' in navigator) for (const a of ['play', 'pause', 'seekbackward', 'seekforward', 'seekto', 'previoustrack', 'nexttrack']) navigator.mediaSession.setActionHandler(a, () => { }); } catch { } };
@@ -63,14 +79,35 @@ export function runExam(o) {
         h('div', { class: 'row' }, btn('Back to the exam', () => show(), 'ghost'), btn('Submit exam', () => modal('Submit your exam?', (un ? `You have ${un} unanswered. ` : '') + 'After submitting you cannot change anything.', [['Cancel', null, 'ghost'], ['Yes, submit', () => finish('cadete')]]))))));
   }
   async function play(x) {
-    if (lockEl) return; const used = (o.plays[x.n] || 0); if (used >= o.maxPlays) return toast('No plays left for this audio.');
-    const url = await o.getAudio(x.au); if (!url) return toast('Audio not available. Tell your proctor.');
+    if (lockEl || starting) return; const used = (o.plays[x.n] || 0); if (used >= o.maxPlays) return toast('No plays left for this audio.');
+    starting = true; // the lead-in must not consume an extra play; the count is saved once, before any sound
+    let url; try { url = await o.getAudio(x.au); } catch { starting = false; return toast('Audio not available. Tell your proctor.'); }
+    if (!url) { starting = false; return toast('Audio not available. Tell your proctor.'); }
     stopAudio(); o.plays[x.n] = used + 1; try { await o.onPlay(x.n, used + 1); } catch { } // se guarda ANTES de sonar
+    const my = audGen; starting = true;
+    const ac = audioCtx();
+    const sil = silentUrl(LEAD_S), warmEl = new Audio(sil); warmEl.preload = 'auto';
+    const warmPlay = warmEl.play().catch(() => warmupSilence(LEAD_S, my, () => audGen)); // same user gesture
+    const decodeP = ac ? fetch(url).then(r => r.arrayBuffer()).then(b => ac.decodeAudioData(b.slice(0))).catch(() => null) : Promise.resolve(null);
     audio = new Audio(); audio.preload = 'auto'; audio.controls = false; audio.src = url; lockMedia(); show(true);
-    audio.onended = () => { stopAudio(); if (view === 'item') show(true); }; audio.play().catch(() => toast('The audio could not be played.'));
+    const warmEnd = Promise.resolve(warmPlay).then(() => new Promise(r => { warmEl.onended = r; setTimeout(r, LEAD_S * 1000 + 80); }));
+    let decoded = null;
+    try { const pack = await Promise.all([warmEnd, decodeP]); decoded = pack[1]; } catch { }
+    try { URL.revokeObjectURL(sil); } catch { }
+    if (my !== audGen || ended) { starting = false; return; }
+    const endedUI = () => { starting = false; stopAudio(); if (view === 'item') show(true); };
+    if (decoded && ac) {
+      const src = ac.createBufferSource(); src.buffer = decoded; const g = ac.createGain(); src.connect(g); g.connect(ac.destination);
+      src.onended = endedUI; src.start();
+      audio._src = src; // so stopAudio can halt it
+      try { if (window.__audPlays) window.__audPlays.push({ t: performance.now(), src: url, via: 'webaudio' }); } catch { }
+      starting = false; if (view === 'item') show(true); return;
+    }
+    audio.onended = endedUI;
+    try { await waitReady(audio, 2000); if (my !== audGen || ended) { starting = false; return; } await audio.play(); starting = false; if (view === 'item') show(true); } catch { starting = false; toast('The audio could not be played.'); if (view === 'item') show(true); }
   }
   function show(keepAudio) {
-    view = 'item'; if (!keepAudio) stopAudio(); const k = seq[i], x = it[k], perm = P.op[k], rem = o.maxPlays - (o.plays[x.n] || 0), playing = audio && !audio.paused && !audio.ended, b = blockOf(k), n1 = P[o.bloque].length;
+    view = 'item'; if (!keepAudio) stopAudio(); const k = seq[i], x = it[k], perm = P.op[k], rem = o.maxPlays - (o.plays[x.n] || 0), playing = starting || (audio && !audio.paused && !audio.ended), b = blockOf(k), n1 = P[o.bloque].length;
     const firstOf2 = i === n1 && n1 > 0 && n1 < seq.length;
     mount(o.root, h('header', null, h('div', null, h('b', null, TI), h('span', null, `${i < n1 ? 'Block 1' : 'Block 2'} · ${b === 'A' ? 'with audio' : 'without audio'} · Question ${i + 1} of ${N}`)), h('span', { class: 'timer', id: 'tm', title: 'Time left' }, mmss(left()))),
       h('div', { class: 'prog2' }, (() => { const bar = h('i'); bar.style.width = (100 * o.answers.filter(a => a >= 0).length / N) + '%'; return bar; })()),

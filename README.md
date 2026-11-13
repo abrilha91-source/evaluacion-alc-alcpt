@@ -1,4 +1,4 @@
-# Evaluación Oficial ALC / ALCPT · Esc. Mil. Enfría. (versión SIN internet, v0.4.0)
+# Evaluación Oficial ALC / ALCPT · Esc. Mil. Enfría. (versión SIN internet, v0.4.1)
 
 App web instalable (PWA), **exclusiva para evaluaciones formales**: ALC (evaluaciones parciales) y ALCPT (diagnóstico, final y seguimiento, según lo ordenado). No tiene modo de práctica: para practicar se usa «Misión: Obtener la Barra I».
 
